@@ -122,6 +122,13 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
 
+    - name: Compute image tag
+      id: tag
+      run: |
+        SHORT_SHA=${GITHUB_SHA::7}
+        TAG=main-${SHORT_SHA}
+        echo "tag=$TAG" >> $GITHUB_OUTPUT    
+
     - name: Push container image
       if: github.event_name != 'pull_request'
       uses: docker/build-push-action@v5
@@ -177,9 +184,9 @@ jobs:
 
     - name: Load Docker image into kind
       run: |
-        docker save ghcr.io/owolabi16/rayda:main-08d3aa1 -o /tmp/image.tar
+        docker save ghcr.io/owolabi16/rayda:${{ steps.tag.outputs.tag }} -o /tmp/image.tar
         docker load -i /tmp/image.tar
-        kind load docker-image ghcr.io/owolabi16/rayda:main-08d3aa1 --name test
+        kind load docker-image ghcr.io/owolabi16/rayda:${{ steps.tag.outputs.tag }} --name test
 
     - name: Install NGINX Ingress
       run: |
