@@ -26,7 +26,7 @@ COPY --chown=appuser:appuser . .
 FROM gcr.io/distroless/python3-debian12
 
 # Copy Python packages from builder
-COPY --from=builder /home/appuser/.local /home/appuser/.local
+COPY --from=builder /usr/local /usr/local
 
 # Copy application from builder
 COPY --from=builder --chown=nonroot:nonroot /app /app
