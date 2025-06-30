@@ -125,9 +125,11 @@ jobs:
     - name: Compute image tag
       id: tag
       run: |
+        BRANCH_NAME=$(echo "${GITHUB_REF##*/}" | tr '[:upper:]' '[:lower:]')
         SHORT_SHA=${GITHUB_SHA::7}
-        TAG=main-${SHORT_SHA}
-        echo "tag=$TAG" >> $GITHUB_OUTPUT    
+        TAG=${BRANCH_NAME}-${SHORT_SHA}
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+   
 
     - name: Push container image
       if: github.event_name != 'pull_request'
@@ -184,9 +186,10 @@ jobs:
 
     - name: Load Docker image into kind
       run: |
-        docker save ghcr.io/owolabi16/rayda:${{ steps.tag.outputs.tag }} -o /tmp/image.tar
+        TAG=${{ needs.build-and-scan.outputs.image-tag }}
+        docker save ghcr.io/owolabi16/rayda:$TAG -o /tmp/image.tar
         docker load -i /tmp/image.tar
-        kind load docker-image ghcr.io/owolabi16/rayda:${{ steps.tag.outputs.tag }} --name test
+        kind load docker-image ghcr.io/owolabi16/rayda:$TAG --name test
 
     - name: Install NGINX Ingress
       run: |
