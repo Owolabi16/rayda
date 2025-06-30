@@ -58,7 +58,7 @@ jobs:
             assert response.json()["message"] == "Item created"
         EOF
         
-        pytest tests/ -v
+        PYTHONPATH=. pytest tests/ -v
 
   # Build and scan container
   build-and-scan:
