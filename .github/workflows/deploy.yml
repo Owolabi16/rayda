@@ -177,7 +177,7 @@ jobs:
 
     - name: Load Docker image into kind
       run: |
-        docker save ghcr.io/owolabi16/rayda:${{ github.sha }} -o /tmp/image.tar
+        docker save ghcr.io/owolabi16/rayda:main-${{ github.sha }} -o /tmp/image.tar
         docker load -i /tmp/image.tar
         kind load docker-image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} --name test
 
