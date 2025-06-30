@@ -1,0 +1,137 @@
+groups:
+  - name: fastapi-service
+    interval: 30s
+    rules:
+      # Service availability
+      - alert: ServiceDown
+        expr: up{job="fastapi-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: fastapi
+        annotations:
+          summary: "FastAPI service is down"
+          description: "{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 2 minutes."
+
+      # High error rate
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(fastapi_http_requests_total{status=~"5.."}[5m])) by (job)
+            /
+            sum(rate(fastapi_http_requests_total[5m])) by (job)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }} for {{ $labels.job }}"
+
+      # High response time
+      - alert: HighResponseTime
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(fastapi_http_request_duration_seconds_bucket[5m])) by (le, job)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "High response time detected"
+          description: "95th percentile response time is {{ $value }}s for {{ $labels.job }}"
+
+      # Pod restart
+      - alert: PodRestartingTooOften
+        expr: |
+          rate(kube_pod_container_status_restarts_total{namespace="production", pod=~"fastapi-service-.*"}[15m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "Pod restarting too often"
+          description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes"
+
+      # High CPU usage
+      - alert: HighCPUUsage
+        expr: |
+          (
+            sum(rate(container_cpu_usage_seconds_total{namespace="production", pod=~"fastapi-service-.*"}[5m])) by (pod)
+            / 
+            sum(container_spec_cpu_quota{namespace="production", pod=~"fastapi-service-.*"}/container_spec_cpu_period{namespace="production", pod=~"fastapi-service-.*"}) by (pod)
+          ) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "High CPU usage"
+          description: "Pod {{ $labels.pod }} CPU usage is {{ $value | humanizePercentage }}"
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: |
+          (
+            sum(container_memory_working_set_bytes{namespace="production", pod=~"fastapi-service-.*"}) by (pod)
+            /
+            sum(container_spec_memory_limit_bytes{namespace="production", pod=~"fastapi-service-.*"}) by (pod)
+          ) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "High memory usage"
+          description: "Pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }}"
+
+      # Too many pods
+      - alert: HorizontalPodAutoscalerMaxedOut
+        expr: |
+          kube_horizontalpodautoscaler_status_current_replicas{namespace="production", horizontalpodautoscaler="fastapi-service"}
+          ==
+          kube_horizontalpodautoscaler_spec_max_replicas{namespace="production", horizontalpodautoscaler="fastapi-service"}
+        for: 5m
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "HPA has reached maximum replicas"
+          description: "HPA {{ $labels.horizontalpodautoscaler }} has been at maximum replicas for 5 minutes"
+
+      # Certificate expiry
+      - alert: CertificateExpiringSoon
+        expr: |
+          certmanager_certificate_expiration_timestamp_seconds{namespace="production"} - time() < 7 * 24 * 60 * 60
+        for: 1h
+        labels:
+          severity: warning
+          service: fastapi
+        annotations:
+          summary: "Certificate expiring soon"
+          description: "Certificate {{ $labels.name }} in namespace {{ $labels.namespace }} expires in {{ $value | humanizeDuration }}"
+
+  - name: kubernetes
+    interval: 30s
+    rules:
+      # Node not ready
+      - alert: KubernetesNodeNotReady
+        expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kubernetes node not ready"
+          description: "Node {{ $labels.node }} has been unready for more than 5 minutes"
+
+      # Persistent volume issues
+      - alert: KubernetesPersistentVolumeError
+        expr: kube_persistentvolume_status_phase{phase=~"Failed|Pending"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Persistent volume error"
+          description: "Persistent volume {{ $labels.persistentvolume }} is in {{ $labels.phase }} state"

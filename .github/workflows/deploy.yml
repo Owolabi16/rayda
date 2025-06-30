@@ -1,1 +1,383 @@
-new
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # Code quality and security checks
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest httpx
+
+    - name: Run tests
+      run: |
+        # Create basic test for the assessment
+        mkdir -p tests
+        cat > tests/test_main.py << 'EOF'
+        from fastapi.testclient import TestClient
+        from main import app
+        
+        client = TestClient(app)
+        
+        def test_health_check():
+            response = client.get("/health")
+            assert response.status_code == 200
+            assert response.json()["status"] == "healthy"
+        
+        def test_get_items():
+            response = client.get("/items")
+            assert response.status_code == 200
+            assert "items" in response.json()
+        
+        def test_create_item():
+            response = client.post("/items", json={"name": "test"})
+            assert response.status_code == 200
+            assert response.json()["message"] == "Item created"
+        EOF
+        
+        pytest tests/ -v
+
+  # Build and scan container
+  build-and-scan:
+    name: Build and Scan Container
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build container image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=docker,dest=/tmp/image.tar
+
+    - name: Scan container with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        input: /tmp/image.tar
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Push container image
+      if: github.event_name != 'pull_request'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Local Kubernetes testing with kind
+  test-k8s-deployment:
+    name: Test Kubernetes Deployment
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Install kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+
+    - name: Create kind cluster
+      run: |
+        kind create cluster --name test --config=- <<EOF
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+          kubeadmConfigPatches:
+          - |
+            kind: InitConfiguration
+            nodeRegistration:
+              kubeletExtraArgs:
+                node-labels: "ingress-ready=true"
+          extraPortMappings:
+          - containerPort: 80
+            hostPort: 80
+            protocol: TCP
+          - containerPort: 443
+            hostPort: 443
+            protocol: TCP
+        EOF
+
+    - name: Load Docker image into kind
+      run: |
+        docker load -i /tmp/image.tar
+        kind load docker-image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} --name test
+
+    - name: Install NGINX Ingress
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=90s
+
+    - name: Deploy application
+      run: |
+        # Create namespace
+        kubectl apply -f k8s/namespace.yaml
+        
+        # Create dummy secret for testing
+        kubectl create secret generic fastapi-secrets \
+          --from-literal=API_SECRET_KEY=test-secret \
+          -n production
+        
+        # Apply all manifests
+        for manifest in k8s/*.yaml; do
+          kubectl apply -f $manifest -n production || true
+        done
+        
+        # Update image to use local one
+        kubectl set image deployment/fastapi-service \
+          fastapi=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          -n production
+        
+        # Wait for deployment
+        kubectl rollout status deployment/fastapi-service -n production --timeout=5m
+
+    - name: Validate deployment
+      run: |
+        # Check pods are running
+        kubectl get pods -n production
+        kubectl wait --for=condition=ready pod -l app=fastapi-service -n production --timeout=300s
+        
+        # Test service endpoints
+        kubectl port-forward svc/fastapi-service 8080:80 -n production &
+        sleep 10
+        
+        # Health check
+        curl -f http://localhost:8080/health
+        curl -f http://localhost:8080/items
+        
+        # Test HPA
+        kubectl get hpa -n production
+        
+        # Check logs
+        kubectl logs -l app=fastapi-service -n production --tail=50
+
+  # Deploy to staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.api.example.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Install kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+
+    - name: Create kind cluster
+      run: |
+        kind create cluster --name staging --config=- <<EOF
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+          kubeadmConfigPatches:
+          - |
+            kind: InitConfiguration
+            nodeRegistration:
+              kubeletExtraArgs:
+                node-labels: "ingress-ready=true"
+          extraPortMappings:
+          - containerPort: 80
+            hostPort: 80
+            protocol: TCP
+          - containerPort: 443
+            hostPort: 443
+            protocol: TCP
+        EOF
+
+    - name: Install NGINX Ingress Controller
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=90s
+
+    - name: Create staging namespace
+      run: |
+        kubectl create namespace staging || true
+
+    - name: Deploy to staging
+      run: |
+        # Apply all manifests
+        kubectl apply -f k8s/configmap.yaml -n staging
+        kubectl apply -f k8s/serviceaccount.yaml -n staging
+        kubectl apply -f k8s/networkpolicy.yaml -n staging
+        kubectl apply -f k8s/service.yaml -n staging
+        kubectl apply -f k8s/deployment.yaml -n staging
+        
+        # Update image
+        kubectl set image deployment/fastapi-service \
+          fastapi=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:develop-${{ github.sha }} \
+          -n staging
+
+        # Wait for rollout
+        kubectl rollout status deployment/fastapi-service -n staging --timeout=5m
+
+    - name: Run smoke tests
+      run: |
+        # Wait for service to be ready
+        kubectl wait --for=condition=ready pod -l app=fastapi-service -n staging --timeout=300s
+        
+        # Port forward to test
+        kubectl port-forward svc/fastapi-service 8080:80 -n staging &
+        sleep 5
+        
+        # Run health check
+        curl -f http://localhost:8080/health || exit 1
+        curl -f http://localhost:8080/items || exit 1
+
+  # Deploy to production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.example.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.PRODUCTION_KUBECONFIG }}" | base64 -d > kubeconfig
+        echo "KUBECONFIG=${PWD}/kubeconfig" >> $GITHUB_ENV
+
+    - name: Create deployment backup
+      run: |
+        kubectl get deployment fastapi-service -n production -o yaml > deployment-backup.yaml
+
+    - name: Deploy to production
+      run: |
+        # Update image tag
+        kubectl set image deployment/fastapi-service \
+          fastapi=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ github.sha }} \
+          -n production
+
+        # Wait for rollout with timeout
+        kubectl rollout status deployment/fastapi-service -n production --timeout=10m
+
+    - name: Verify deployment
+      run: |
+        # Check if all pods are ready
+        kubectl wait --for=condition=ready pod -l app=fastapi-service -n production --timeout=300s
+        
+        # Run health checks
+        PROD_URL="https://api.example.com"
+        for i in {1..5}; do
+          if curl -f ${PROD_URL}/health; then
+            echo "Health check passed"
+            break
+          fi
+          if [ $i -eq 5 ]; then
+            echo "Health check failed after 5 attempts"
+            exit 1
+          fi
+          sleep 10
+        done
+
+    - name: Upload deployment backup
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: deployment-backup
+        path: deployment-backup.yaml
+        retention-days: 30
